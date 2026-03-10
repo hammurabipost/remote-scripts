@@ -134,17 +134,27 @@ fi
 # ── Authenticate to Tailscale ─────────────────────────────────────────────────
 section "Authenticating to Tailscale"
 
+_tailscale_up() {
+  local output
+  output=$(sudo tailscale up --authkey="$TAILSCALE_AUTHKEY" --accept-routes 2>&1) || true
+  # Extract auth URL if present
+  AUTH_URL=$(echo "$output" | grep -oE 'https://login\.tailscale\.com/[^ ]+' | head -1 || true)
+  echo "$output"
+}
+
+AUTH_URL=""
+
 if tailscale status &>/dev/null 2>&1; then
   CURRENT_STATUS=$(tailscale status --json 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('BackendState',''))" 2>/dev/null || echo "unknown")
   if [[ "$CURRENT_STATUS" == "Running" ]]; then
     log "Already authenticated to Tailscale"
   else
-    sudo tailscale up --authkey="$TAILSCALE_AUTHKEY" --accept-routes
-    log "Tailscale authenticated"
+    _tailscale_up
+    [[ -z "$AUTH_URL" ]] && log "Tailscale authenticated"
   fi
 else
-  sudo tailscale up --authkey="$TAILSCALE_AUTHKEY" --accept-routes
-  log "Tailscale authenticated"
+  _tailscale_up
+  [[ -z "$AUTH_URL" ]] && log "Tailscale authenticated"
 fi
 
 sleep 2
@@ -334,3 +344,17 @@ echo "    VNC (screen):  localhost:${VNC_LOCAL_PORT}"
 echo "    Ollama:        localhost:${OLLAMA_LOCAL_PORT}"
 echo "    Open WebUI:    localhost:${WEBUI_LOCAL_PORT}"
 echo ""
+
+# ── Auth URL reminder (shown last if browser auth is required) ────────────────
+if [[ -n "$AUTH_URL" ]]; then
+  echo -e "${RED}╔══════════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${RED}║  ACTION REQUIRED — Tailscale needs browser authentication!  ║${NC}"
+  echo -e "${RED}╚══════════════════════════════════════════════════════════════╝${NC}"
+  echo ""
+  echo -e "  Visit this URL to authenticate this machine with Tailscale:"
+  echo ""
+  echo -e "  ${GREEN}${AUTH_URL}${NC}"
+  echo ""
+  echo -e "  After authenticating, re-run: ${BLUE}ssh mac-mini${NC}"
+  echo ""
+fi
