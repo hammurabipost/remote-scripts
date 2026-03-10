@@ -79,6 +79,39 @@ else
   error "Unsupported OS: $OS"
 fi
 
+# ── Fix broken apt repos before installing anything ───────────────────────────
+section "Fixing APT Repositories"
+
+if [[ "$DISTRO" == "debian" ]]; then
+  # Fix Yarn GPG key — common issue in Codespaces and fresh Ubuntu containers
+  if apt-get update 2>&1 | grep -q "dl.yarnpkg.com"; then
+    warn "Yarn repo GPG error detected — fixing..."
+
+    # Modern fix: add key to keyring (apt-key is deprecated in Ubuntu 22+)
+    if curl -fsSL https://dl.yarnpkg.com/debian/pubkey.gpg \
+        | gpg --dearmor \
+        | sudo tee /usr/share/keyrings/yarn-archive-keyring.gpg > /dev/null 2>&1; then
+
+      # Rewrite the yarn source to use the signed-by keyring
+      echo "deb [signed-by=/usr/share/keyrings/yarn-archive-keyring.gpg] \
+https://dl.yarnpkg.com/debian/ stable main" \
+        | sudo tee /etc/apt/sources.list.d/yarn.list > /dev/null
+
+      log "Yarn GPG key fixed"
+    else
+      # Fallback: just remove the broken yarn repo entirely
+      warn "Could not fix Yarn GPG key — removing Yarn repo (Yarn not needed for this setup)"
+      sudo rm -f /etc/apt/sources.list.d/yarn.list
+    fi
+
+    # Re-run update cleanly
+    sudo apt-get update -qq
+    log "APT repos updated cleanly"
+  else
+    log "APT repos OK — no fixes needed"
+  fi
+fi
+
 # ── Install Tailscale ─────────────────────────────────────────────────────────
 section "Installing Tailscale"
 
@@ -86,10 +119,7 @@ if command -v tailscale &>/dev/null; then
   log "Tailscale already installed — $(tailscale version | head -1)"
 else
   case "$DISTRO" in
-    debian)
-      curl -fsSL https://tailscale.com/install.sh | sh
-      ;;
-    rhel)
+    debian|rhel)
       curl -fsSL https://tailscale.com/install.sh | sh
       ;;
     arch)
@@ -112,23 +142,72 @@ fi
 # ── Start Tailscale daemon ────────────────────────────────────────────────────
 section "Starting Tailscale"
 
+tailscaled_running() {
+  sudo tailscale status >/dev/null 2>&1
+}
+
+start_tailscaled_manually() {
+  warn "Starting tailscaled manually..."
+  sudo mkdir -p /var/run/tailscale /var/lib/tailscale /var/cache/tailscale
+
+  # Kill any stale instance first
+  sudo pkill -9 tailscaled 2>/dev/null || true
+  sleep 2
+
+  # Explicitly set socket path so it is always predictable
+  sudo tailscaled \
+    --state=/var/lib/tailscale/tailscaled.state \
+    --socket=/var/run/tailscale/tailscaled.sock \
+    --port=41641 \
+    > /tmp/tailscaled.log 2>&1 &
+
+  TAILSCALED_PID=$!
+  log "tailscaled launched (PID: $TAILSCALED_PID)"
+
+  # Brief local wait so the socket likely exists before the auth section polls
+  for i in $(seq 1 5); do
+    [[ -S "/var/run/tailscale/tailscaled.sock" ]] && return 0
+    sleep 1
+  done
+  # Not an error here — the auth section will keep polling up to 30s
+  warn "Socket not yet visible after 5s — auth section will keep waiting..."
+}
+
 if [[ "$DISTRO" == "macos" ]]; then
   sudo brew services start tailscale 2>/dev/null || true
+  log "Tailscale daemon started via brew services"
 else
-  # GitHub Codespaces / containers don't have systemd — use tailscaled directly
-  if command -v systemctl &>/dev/null && systemctl is-system-running &>/dev/null 2>&1; then
-    sudo systemctl enable --now tailscaled
-    log "Tailscale daemon started via systemd"
-  else
-    warn "No systemd detected (likely a container) — starting tailscaled manually"
-    sudo mkdir -p /var/run/tailscale /var/lib/tailscale /var/cache/tailscale
-    sudo tailscaled --state=/var/lib/tailscale/tailscaled.state \
-                    --socket=/var/run/tailscale/tailscaled.sock \
-                    --port=41641 \
-                    > /tmp/tailscaled.log 2>&1 &
-    sleep 3
-    log "tailscaled started in background (PID: $!)"
+  # Detect whether systemd is actually functional (not just installed)
+  SYSTEMD_RUNNING=false
+  if command -v systemctl &>/dev/null; then
+    # is-system-running exits non-zero in containers even if binary exists
+    if systemctl is-system-running 2>/dev/null | grep -qE "running|degraded"; then
+      SYSTEMD_RUNNING=true
+    fi
   fi
+
+  if $SYSTEMD_RUNNING; then
+    warn "systemd detected — attempting to start tailscaled via systemctl..."
+    sudo systemctl enable --now tailscaled 2>/dev/null || true
+
+    # Give systemd a moment, then verify the daemon is actually up.
+    # In GitHub Codespaces systemctl can claim success but never start the daemon.
+    sleep 3
+    if ! tailscaled_running; then
+      warn "systemd reported success but daemon is not responding — falling back to manual start"
+      start_tailscaled_manually
+      # give manual start a bit more time
+      sleep 2
+      if ! tailscaled_running; then
+        warn "manual start failed; see /tmp/tailscaled.log for clues"
+      fi
+    else
+      log "Tailscale daemon started via systemd"
+    fi
+  else
+    start_tailscaled_manually
+  fi
+
 fi
 
 # ── Authenticate to Tailscale ─────────────────────────────────────────────────
@@ -157,9 +236,14 @@ else
   [[ -z "$AUTH_URL" ]] && log "Tailscale authenticated"
 fi
 
+# Verify we got an IP
 sleep 2
 THIS_IP=$(tailscale ip -4 2>/dev/null || echo "unknown")
-log "This machine's Tailscale IP: $THIS_IP"
+if [[ "$THIS_IP" == "unknown" ]]; then
+  warn "Could not get Tailscale IP — auth may have failed. Check: sudo tailscale status"
+else
+  log "This machine's Tailscale IP: $THIS_IP"
+fi
 
 # ── Generate SSH key if needed ────────────────────────────────────────────────
 section "SSH Key Setup"
@@ -266,83 +350,250 @@ fi
 # ── Create helper scripts ─────────────────────────────────────────────────────
 section "Creating Helper Scripts"
 
-SCRIPTS_DIR="$HOME/.mac-mini"
+# Scripts go into the workspace root so they are visible and easy to find.
+# In Codespaces this is /workspaces/<repo>; elsewhere it falls back to $HOME.
+if [[ -n "${CODESPACES:-}" ]] && [[ -d "/workspaces" ]]; then
+  SCRIPTS_DIR="/workspaces/mac-mini"
+elif [[ -n "${GITHUB_WORKSPACE:-}" ]] && [[ -d "$GITHUB_WORKSPACE" ]]; then
+  SCRIPTS_DIR="${GITHUB_WORKSPACE}/mac-mini"
+else
+  SCRIPTS_DIR="$HOME/mac-mini"
+fi
 mkdir -p "$SCRIPTS_DIR"
+log "Helper scripts will be created in: $SCRIPTS_DIR"
 
-# tunnel-only.sh — open all tunnels without interactive shell
+# ── tunnel.sh ────────────────────────────────────────────────────────────────
 cat > "$SCRIPTS_DIR/tunnel.sh" <<SCRIPT
 #!/usr/bin/env bash
-# Opens all SSH tunnels to Mac Mini (no interactive shell)
-echo "Opening tunnels to Mac Mini..."
-echo "  VNC:    localhost:${VNC_LOCAL_PORT}"
-echo "  Ollama: localhost:${OLLAMA_LOCAL_PORT}"
-echo "  WebUI:  localhost:${WEBUI_LOCAL_PORT}"
+# Opens all SSH tunnels to Mac Mini without an interactive shell.
+# Leave this running in a terminal — Ctrl+C closes all tunnels.
+set -euo pipefail
+RED='\033[0;31m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'; NC='\033[0m'
+echo -e "\n\${BLUE}Opening tunnels to Mac Mini...\${NC}"
+echo -e "  \${GREEN}VNC (screen):  \${NC}localhost:${VNC_LOCAL_PORT}    →  mac-mini:${VNC_REMOTE_PORT}"
+echo -e "  \${GREEN}Ollama:        \${NC}localhost:${OLLAMA_LOCAL_PORT}  →  mac-mini:${OLLAMA_REMOTE_PORT}"
+echo -e "  \${GREEN}Open WebUI:    \${NC}localhost:${WEBUI_LOCAL_PORT}   →  mac-mini:${WEBUI_REMOTE_PORT}"
 echo ""
-echo "Press Ctrl+C to close all tunnels"
+echo "Press Ctrl+C to close all tunnels."
+echo ""
 ssh -N mac-mini
 SCRIPT
 
-# vnc.sh — open tunnel + launch VNC viewer
+# ── vnc.sh ───────────────────────────────────────────────────────────────────
+# NOTE: VNC from a headless environment like Codespaces requires forwarding the
+# tunnel port back to your local machine first (see guide printed at the end).
 cat > "$SCRIPTS_DIR/vnc.sh" <<SCRIPT
 #!/usr/bin/env bash
-# Opens VNC tunnel and launches viewer
-echo "Opening VNC tunnel to Mac Mini..."
+# Opens a VNC-only SSH tunnel to Mac Mini.
+# In Codespaces: forward port ${VNC_LOCAL_PORT} in the Ports panel, then open
+# a VNC client on your local machine pointing to localhost:${VNC_LOCAL_PORT}.
+set -euo pipefail
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+echo -e "\${GREEN}Opening VNC tunnel to Mac Mini on localhost:${VNC_LOCAL_PORT}...\${NC}"
+
+# Kill any previous tunnel on this port
+fuser -k ${VNC_LOCAL_PORT}/tcp 2>/dev/null || true
+
 ssh -f -N -L ${VNC_LOCAL_PORT}:127.0.0.1:${VNC_REMOTE_PORT} mac-mini
 sleep 1
 
 if [[ "\$(uname)" == "Darwin" ]]; then
+  echo -e "\${GREEN}Launching macOS Screen Sharing...\${NC}"
   open vnc://localhost:${VNC_LOCAL_PORT}
 elif command -v vncviewer &>/dev/null; then
   vncviewer localhost:${VNC_LOCAL_PORT}
 elif command -v xtightvncviewer &>/dev/null; then
   xtightvncviewer localhost:${VNC_LOCAL_PORT}
 else
-  echo "VNC tunnel is open at localhost:${VNC_LOCAL_PORT}"
-  echo "Connect with your VNC client to: localhost:${VNC_LOCAL_PORT}"
+  echo -e "\${YELLOW}Tunnel is open.\${NC}"
+  echo "No VNC client found locally. Connect your VNC client to:"
+  echo "  localhost:${VNC_LOCAL_PORT}"
+  echo ""
+  echo "In Codespaces: open the Ports panel (Ctrl+Shift+P → 'Ports: Focus on Ports View'),"
+  echo "forward port ${VNC_LOCAL_PORT}, then open the forwarded address in a VNC client."
 fi
 SCRIPT
 
-# status.sh — check connectivity
+# ── status.sh ────────────────────────────────────────────────────────────────
 cat > "$SCRIPTS_DIR/status.sh" <<SCRIPT
 #!/usr/bin/env bash
-echo "=== Tailscale Status ==="
-tailscale status 2>/dev/null || echo "Tailscale not running"
+# Checks Tailscale, SSH reachability, and open tunnel ports.
+GREEN='\033[0;32m'; RED='\033[0;31m'; BLUE='\033[0;34m'; NC='\033[0m'
+
+echo -e "\n\${BLUE}=== Tailscale Status ===\${NC}"
+tailscale status 2>/dev/null || echo -e "\${RED}Tailscale not running\${NC}"
+
+echo -e "\n\${BLUE}=== SSH Connection Test ===\${NC}"
+if ssh -o ConnectTimeout=5 -o BatchMode=yes mac-mini "echo 'reachable'" &>/dev/null; then
+  echo -e "\${GREEN}Mac Mini is reachable via SSH ✓\${NC}"
+else
+  echo -e "\${RED}Mac Mini not reachable ✗\${NC}"
+  echo "Check: tailscale status | grep mac-mini"
+fi
+
+echo -e "\n\${BLUE}=== Open Tunnel Ports ===\${NC}"
+for port in ${VNC_LOCAL_PORT} ${OLLAMA_LOCAL_PORT} ${WEBUI_LOCAL_PORT}; do
+  if ss -tlnp 2>/dev/null | grep -q ":\${port} " || \
+     lsof -i ":\${port}" 2>/dev/null | grep -q LISTEN; then
+    echo -e "  \${GREEN}\${port} OPEN ✓\${NC}"
+  else
+    echo -e "  \${RED}\${port} closed\${NC}"
+  fi
+done
 echo ""
-echo "=== SSH Connection Test ==="
-ssh -o ConnectTimeout=5 -o BatchMode=yes mac-mini "echo 'Mac Mini reachable ✓'" 2>/dev/null || echo "Mac Mini not reachable ✗"
-echo ""
-echo "=== Open Tunnels ==="
-ss -tlnp 2>/dev/null | grep -E "${VNC_LOCAL_PORT}|${OLLAMA_LOCAL_PORT}|${WEBUI_LOCAL_PORT}" || \
-lsof -i ":${VNC_LOCAL_PORT}" -i ":${OLLAMA_LOCAL_PORT}" -i ":${WEBUI_LOCAL_PORT}" 2>/dev/null || \
-echo "No tunnels currently open"
 SCRIPT
 
 chmod +x "$SCRIPTS_DIR/tunnel.sh" "$SCRIPTS_DIR/vnc.sh" "$SCRIPTS_DIR/status.sh"
 log "Helper scripts created in $SCRIPTS_DIR/"
 
+# ── Install noVNC on Mac Mini (browser-based VNC) ────────────────────────────
+section "Setting Up Browser VNC (noVNC) on Mac Mini"
+
+NOVNC_PORT=6080
+
+# Run the noVNC install+start over SSH on the Mac Mini
+ssh -o StrictHostKeyChecking=no -i "$SSH_KEY_PATH" "${MAC_MINI_USER}@${MAC_MINI_TAILSCALE_IP}" bash << 'REMOTE'
+set -euo pipefail
+
+NOVNC_PORT=6080
+NOVNC_DIR="$HOME/.novnc"
+
+# Install noVNC if not present
+if [[ ! -d "$NOVNC_DIR" ]]; then
+  echo "[→] Cloning noVNC..."
+  git clone --depth 1 https://github.com/novnc/noVNC.git "$NOVNC_DIR"
+  git clone --depth 1 https://github.com/novnc/websockify.git "$NOVNC_DIR/utils/websockify"
+  echo "[✓] noVNC installed at $NOVNC_DIR"
+else
+  echo "[✓] noVNC already installed at $NOVNC_DIR"
+fi
+
+# Make sure Screen Sharing (VNC) is enabled
+sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+
+# Kill any existing noVNC/websockify on this port
+pkill -f "websockify.*${NOVNC_PORT}" 2>/dev/null || true
+sleep 1
+
+# Start noVNC — websockify bridges HTTP→VNC
+nohup "$NOVNC_DIR/utils/novnc_proxy" \
+  --vnc localhost:5900 \
+  --listen ${NOVNC_PORT} \
+  > /tmp/novnc.log 2>&1 &
+
+echo "[✓] noVNC started on port ${NOVNC_PORT} (log: /tmp/novnc.log)"
+REMOTE
+
+log "noVNC is running on Mac Mini port ${NOVNC_PORT}"
+
+# ── Open SSH tunnel for noVNC port ────────────────────────────────────────────
+section "Opening Browser VNC Tunnel"
+
+# Kill any stale tunnel on this port first
+fuser -k "${NOVNC_PORT}/tcp" 2>/dev/null || true
+sleep 1
+
+# Open the tunnel in the background
+ssh -f -N \
+  -L "${NOVNC_PORT}:127.0.0.1:${NOVNC_PORT}" \
+  -L "${VNC_LOCAL_PORT}:127.0.0.1:${VNC_REMOTE_PORT}" \
+  -L "${OLLAMA_LOCAL_PORT}:127.0.0.1:${OLLAMA_REMOTE_PORT}" \
+  -L "${WEBUI_LOCAL_PORT}:127.0.0.1:${WEBUI_REMOTE_PORT}" \
+  -i "$SSH_KEY_PATH" \
+  mac-mini
+
+log "All tunnels open"
+
+# ── Expose the noVNC port in Codespaces ───────────────────────────────────────
+IN_CODESPACES=false
+[[ -n "${CODESPACES:-}" ]] && IN_CODESPACES=true
+
+if $IN_CODESPACES; then
+  section "Exposing Ports in Codespaces"
+
+  # Use gh CLI to make port public so it opens in the browser
+  # (requires gh CLI which is pre-installed in all Codespaces)
+  if command -v gh &>/dev/null; then
+    gh codespace ports visibility "${NOVNC_PORT}:public" 2>/dev/null && \
+      log "Port ${NOVNC_PORT} set to public in Codespaces" || \
+      warn "Could not set port visibility via gh — forward manually in the Ports panel"
+  fi
+
+  # Derive the Codespaces forwarded URL
+  # Format: https://<codespace-name>-<port>.app.github.dev
+  CODESPACE_NAME="${CODESPACE_NAME:-$(hostname)}"
+  BROWSER_URL="https://${CODESPACE_NAME}-${NOVNC_PORT}.app.github.dev/vnc.html?autoconnect=true&resize=scale"
+else
+  BROWSER_URL="http://localhost:${NOVNC_PORT}/vnc.html?autoconnect=true&resize=scale"
+fi
+
+# ── Update the vnc.sh helper to use noVNC ────────────────────────────────────
+cat > "$SCRIPTS_DIR/vnc.sh" << SCRIPT
+#!/usr/bin/env bash
+# Opens browser-based VNC (noVNC) to Mac Mini.
+GREEN='\033[0;32m'; BLUE='\033[0;34m'; NC='\033[0m'
+
+NOVNC_PORT=${NOVNC_PORT}
+BROWSER_URL="${BROWSER_URL}"
+
+echo -e "\${BLUE}Ensuring noVNC tunnel is open on port \${NOVNC_PORT}...\${NC}"
+fuser -k "\${NOVNC_PORT}/tcp" 2>/dev/null || true
+sleep 1
+ssh -f -N -L "\${NOVNC_PORT}:127.0.0.1:\${NOVNC_PORT}" mac-mini
+sleep 1
+
+echo -e "\${GREEN}Opening Mac Mini desktop in your browser...\${NC}"
+echo "  URL: \${BROWSER_URL}"
+echo ""
+
+if [[ "\$(uname)" == "Darwin" ]]; then
+  open "\${BROWSER_URL}"
+elif command -v xdg-open &>/dev/null; then
+  xdg-open "\${BROWSER_URL}"
+else
+  echo "Open this URL in your browser:"
+  echo "  \${BROWSER_URL}"
+fi
+SCRIPT
+chmod +x "$SCRIPTS_DIR/vnc.sh"
+
 # ── Final summary ─────────────────────────────────────────────────────────────
 section "Setup Complete"
 
 echo ""
-echo -e "${GREEN}Everything is configured. Here's how to use it:${NC}"
+echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${GREEN}║         Mac Mini is ready — open in your browser!           ║${NC}"
+echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "  ${BLUE}SSH into Mac Mini:${NC}"
+echo -e "${BLUE}── Open Mac Mini desktop in browser ───────────────────────────${NC}"
+echo ""
+echo -e "    ${GREEN}${BROWSER_URL}${NC}"
+echo ""
+
+if $IN_CODESPACES; then
+echo -e "${YELLOW}  Codespaces note:${NC}"
+echo "  If the URL above gives a 404, VS Code may not have registered"
+echo "  the port yet. Do this once:"
+echo ""
+echo "    1. Open Ports panel: Ctrl+Shift+P → 'Ports: Focus on Ports View'"
+echo "    2. Click '+ Forward a Port' → enter: ${NOVNC_PORT}"
+echo "    3. Right-click the forwarded port → 'Open in Browser'"
+echo "    4. Or copy the HTTPS URL shown in the Ports panel"
+echo ""
+fi
+
+echo -e "${BLUE}── Other ports (tunnel already open) ──────────────────────────${NC}"
+echo "    Ollama API:   http://localhost:${OLLAMA_LOCAL_PORT}"
+echo "    Open WebUI:   http://localhost:${WEBUI_LOCAL_PORT}"
+echo "    Raw VNC:      localhost:${VNC_LOCAL_PORT}  (for native VNC clients)"
+echo ""
+echo -e "${BLUE}── SSH ─────────────────────────────────────────────────────────${NC}"
 echo "    ssh mac-mini"
 echo ""
-echo -e "  ${BLUE}Open all tunnels (VNC + Ollama + WebUI):${NC}"
-echo "    ~/.mac-mini/tunnel.sh"
-echo ""
-echo -e "  ${BLUE}Open VNC (screen sharing):${NC}"
-echo "    ~/.mac-mini/vnc.sh"
-echo "    Then open:  vnc://localhost:${VNC_LOCAL_PORT}  in your VNC client"
-echo ""
-echo -e "  ${BLUE}Check connectivity status:${NC}"
-echo "    ~/.mac-mini/status.sh"
-echo ""
-echo -e "  ${BLUE}Ports available after tunnel is open:${NC}"
-echo "    VNC (screen):  localhost:${VNC_LOCAL_PORT}"
-echo "    Ollama:        localhost:${OLLAMA_LOCAL_PORT}"
-echo "    Open WebUI:    localhost:${WEBUI_LOCAL_PORT}"
+echo -e "${BLUE}── Helper scripts ──────────────────────────────────────────────${NC}"
+echo "    $SCRIPTS_DIR/tunnel.sh   — reopen all tunnels"
+echo "    $SCRIPTS_DIR/vnc.sh      — reopen browser VNC"
+echo "    $SCRIPTS_DIR/status.sh   — check connectivity"
 echo ""
 
 # ── Auth URL reminder (shown last if browser auth is required) ────────────────
