@@ -186,18 +186,24 @@ else
     warn "systemd detected — attempting to start tailscaled via systemctl..."
     sudo systemctl enable --now tailscaled 2>/dev/null || true
 
-    # Give systemd a moment, then verify the socket actually appeared.
+    # Give systemd a moment, then verify the daemon is actually up.
     # In GitHub Codespaces systemctl can claim success but never start the daemon.
     sleep 3
-    if [[ ! -S "/var/run/tailscale/tailscaled.sock" ]]; then
-      warn "systemd reported success but socket is missing — falling back to manual start"
+    if ! tailscaled_running; then
+      warn "systemd reported success but daemon is not responding — falling back to manual start"
       start_tailscaled_manually
+      # give manual start a bit more time
+      sleep 2
+      if ! tailscaled_running; then
+        warn "manual start failed; see /tmp/tailscaled.log for clues"
+      fi
     else
       log "Tailscale daemon started via systemd"
     fi
   else
     start_tailscaled_manually
   fi
+
 fi
 
 # ── Authenticate to Tailscale ─────────────────────────────────────────────────
@@ -206,23 +212,42 @@ section "Authenticating to Tailscale"
 # Wait for tailscaled socket to be ready before attempting auth
 # (containers can be slow to expose the socket even after the PID appears)
 SOCKET_PATH="/var/run/tailscale/tailscaled.sock"
+
+# remove stale socket file if nothing is listening on it
+if [[ -S "$SOCKET_PATH" ]] && ! sudo ss -lnp 2>/dev/null | grep -q "tailscaled"; then
+  warn "Stale tailscaled socket detected, removing..."
+  sudo rm -f "$SOCKET_PATH"
+fi
+
+# helper to verify the daemon responds
+tailscaled_running() {
+  sudo tailscale status >/dev/null 2>&1
+}
+
 warn "Waiting for tailscaled socket at $SOCKET_PATH..."
 WAIT_SECS=0
 MAX_WAIT=30
-until [[ -S "$SOCKET_PATH" ]] || [[ $WAIT_SECS -ge $MAX_WAIT ]]; do
+while true; do
+  if [[ -S "$SOCKET_PATH" ]] && tailscaled_running; then
+    break
+  fi
+  if [[ $WAIT_SECS -ge $MAX_WAIT ]]; then
+    break
+  fi
   sleep 1
   WAIT_SECS=$((WAIT_SECS + 1))
   echo -n "."
 done
 echo ""
 
-if [[ ! -S "$SOCKET_PATH" ]]; then
+if ! [[ -S "$SOCKET_PATH" ]] || ! tailscaled_running; then
   echo ""
-  warn "Socket never appeared. Last tailscaled log:"
+  warn "tailscaled did not start correctly. Last tailscaled log:"
   tail -30 /tmp/tailscaled.log 2>/dev/null || echo "(no log found)"
-  error "tailscaled socket not found after ${MAX_WAIT}s — daemon did not start correctly"
+  error "tailscaled daemon is not running or not responding after ${MAX_WAIT}s"
 fi
-log "tailscaled socket is ready (after ${WAIT_SECS}s)"
+
+log "tailscaled socket is ready and responsive (after ${WAIT_SECS}s)"
 
 # Now check if already authenticated
 CURRENT_STATUS=$(sudo tailscale status --json 2>/dev/null \
